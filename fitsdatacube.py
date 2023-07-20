@@ -19,9 +19,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 from scipy.interpolate import interp1d as scipy_interp1d
+from scipy.signal import convolve as scipy_convolve
 
 from astropy import units as astropy_u
-from astropy.convolution import convolve as astropy_convolve
 from astropy.io import fits as astropy_fits
 from astropy.utils.data import get_pkg_data_filename as astropy_get_pkg_data_filename
 from astropy.utils.decorators import lazyproperty
@@ -47,7 +47,7 @@ class FitsDatacube:
         self._dc = np.array(astropy_fits.getdata(_dc_obj, ext=0), dtype=float)
         self.wav = np.array(astropy_fits.getdata(_dc_obj, ext=1), dtype=float)
         
-        self.shape = self._dc.shape 
+        self.shape = self._dc.shape
         self._nwav = self._dc.shape[0]
         self._npix = self._dc.shape[1:]
         assert self._nwav == len(self.wav)
@@ -56,17 +56,17 @@ class FitsDatacube:
         if iunits != ounits: 
             self.convert_units(ounits)
     
-    def __init__(self, filename, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _debug_log=False, _no_load=False):
+    def __init__(self, filename=None, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _debug_log=False, _no_load=False):
         """
         Loads a fits file at <filename>.
         <iunits> indicate the input units (fits file) and <ounits> indicate the output units (FitsDatacube instance)
         Units lists have the form: [image units, wavelength units].
         """
-        self.filename = filename
-        
         if not _no_load:
+            self.filename = filename
             self._load(iunits=iunits, ounits=ounits, _debug_log=_debug_log)
         else:
+            self.filename = None
             self._dc = None
             self.wav = None
             self.shape = None
@@ -79,11 +79,12 @@ class FitsDatacube:
     
     def __setitem__(self, index, newvalue):
         self._dc[index] = newvalue
-    
+
     def copy(self, _dc_operation=None):
-        _fdc = FitsDatacube(self.filename, _no_load=True)
+        _fdc = FitsDatacube(_no_load=True)
+        _fdc.filename = self.filename
         _fdc._dc = self._dc.copy() if _dc_operation is None else _dc_operation(self._dc)
-        _fdc.wav = self.wav
+        _fdc.wav = self.wav.copy()
         _fdc.shape = self.shape
         _fdc._nwav = self._nwav
         _fdc._npix = self._npix
@@ -115,8 +116,12 @@ class FitsDatacube:
     __or__        = lambda self, y: self.copy(_dc_operation=lambda x: np.logical_or(x, y._dc) if type(y) is FitsDatacube else x.__or__(y))
     __invert__    = lambda self: self.copy(_dc_operation=lambda x: x.__invert__())
     
-    def sum(self):
-        return np.sum(self._dc)
+    def sum(self): return np.sum(self._dc)
+    def max(self): return np.max(self._dc)
+    def min(self): return np.min(self._dc)
+    def mean(self): return np.mean(self._dc)
+    def median(self): return np.median(self._dc)
+    def std(self): return np.std(self._dc)
     
     def convert_units(self, ounits):
         """Converts the unit system."""
@@ -136,10 +141,10 @@ class FitsDatacube:
             raise Exception("Trouble inferring spectral resolution. Maybe the wavelengths aren't logarithmically distributed?")
         return (np.mean(R1) + np.mean(R2))/2
     
-    def convolve_PSF(self, PSF):
-        copy = self.copy()
-        for wav_index in range(copy._nwav):
-            copy[wav_index, :, :] = PSF._convolve_over(copy[wav_index, :, :])  # convolve over each monochromatic image
+    def convolve_PSF(self, psf, inplace=False):
+        if PSF not in type(psf).__mro__: raise Exception('The psf must be a child of the PSF class.')
+        copy = self if inplace else self.copy()
+        copy._dc = psf._convolve_over(copy._dc)
         return copy
 
     def get_image(self, wav):
@@ -196,9 +201,9 @@ class FitsDatacube:
         return (fig, ax) if not ret_im else (fig, ax, im)
     
     @staticmethod
-    def _plot_spectrum(wavs, thrus, color=None, **kwargs):
+    def _plot_spectrum(wavs, thrus, color=None, alpha=None, **kwargs):
         fig, ax = FitsDatacube._general_plot(**kwargs)
-        ax.plot(wavs, thrus, color=color)
+        ax.plot(wavs, thrus, color=color, alpha=alpha)
         return (fig, ax)
     
     def plot_image(self, wav, **kwargs):
@@ -213,8 +218,16 @@ class FitsDatacube:
     def plot_integrated_spectrum(self, filt2d=None, **kwargs):
         return self._plot_spectrum(self.wav, self.get_integrated_spectrum(filt2d=filt2d), **kwargs)
 
-    def plot_simpleRGB(self, Rfilt, Gfilt, Bfilt, **kwargs):
-        rgb_image = np.dstack((self.get_convolved_image(Rfilt), self.get_convolved_image(Gfilt), self.get_convolved_image(Bfilt)))
+    def plot_simpleRGB(self, Rfilt, Gfilt, Bfilt, rprefoo=None, gprefoo=None, bprefoo=None, rpostfoo=None, gpostfoo=None, bpostfoo=None, **kwargs):
+        rimage, gimage, bimage = self.get_convolved_image(Rfilt), self.get_convolved_image(Gfilt), self.get_convolved_image(Bfilt)
+        if rprefoo is not None: rimage = rprefoo(rimage)
+        if gprefoo is not None: gimage = gprefoo(gimage)
+        if bprefoo is not None: bimage = bprefoo(bimage)
+        rimage, gimage, bimage = rimage/rimage.max(), gimage/gimage.max(), bimage/bimage.max()   # normalize
+        if rpostfoo is not None: rimage = rpostfoo(rimage)
+        if gpostfoo is not None: gimage = gpostfoo(gimage)
+        if bpostfoo is not None: bimage = bpostfoo(bimage)
+        rgb_image = np.dstack((rimage, gimage, bimage))
         return self._plot_image(rgb_image, cmap=None, **kwargs)
     
     
@@ -226,31 +239,40 @@ class Filter:
     DEFAULT_KIND = 'linear'
     DEFAULT_UNITS = ['micron', '1']  # wav, thru
     
-    def __init__(self, filename, kind=DEFAULT_KIND, delim=DEFAULT_DELIM, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS):
+    def __init__(self, filename, delim=DEFAULT_DELIM, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, interp_kind=DEFAULT_KIND, _no_load=False):
         """
         Loads a filter file at <filename>.
         """
         self.filename = filename
-        self.wav, self.thru = self._load(delim=delim)
+        if not _no_load: 
+            self.wav, self.thru = self._load(delim=delim)
+        self.interp_kind = interp_kind
         
         self.units = iunits
         if iunits != ounits: 
             self.convert_units(ounits)
-            
-        self._filt = self._interpolated_function(kind=kind)
        
     def __call__(self, wav):
-        return self._filt(wav)
+        return self.filt(wav)
     
+    def copy(self):
+        _filt = Filter(self.filename, _no_load=True)
+        _filt.wav = self.wav.copy()
+        _filt.thru = self.thru.copy()
+        _filt.interp_kind = self.interp_kind
+        _filt.units = self.units
+        return _filt
+
     def _load(self, delim=DEFAULT_DELIM):
         arr = np.genfromtxt(self.filename, delimiter=delim).T
         return arr[0], arr[1]
         
-    def _interpolated_function(self, kind=DEFAULT_KIND):
+    @lazyproperty
+    def filt(self):
         """
         Creates an interpolated filter function of the wavelength. 
         """
-        return scipy_interp1d(self.wav, self.thru, kind=kind, bounds_error=False, fill_value=0)
+        return scipy_interp1d(self.wav, self.thru, kind=self.interp_kind, bounds_error=False, fill_value=0)
     
     def convert_units(self, ounits):
         self.wav *= astropy_u.Unit(self.units[0]).in_units(ounits[0])
@@ -264,6 +286,26 @@ class Filter:
         wavs = np.linspace(wavmin, wavmax, num=num)
         return FitsDatacube._plot_spectrum(wavs, self(wavs), **kwargs)
     
+
+class BinaryFilter(Filter):
+    DEFAULT_KIND = 'no interp'
+
+    def __init__(self, minwav, maxwav, val=1.0, num=100, interp_kind=DEFAULT_KIND):
+        super().__init__(None, interp_kind=interp_kind, _no_load=True)
+        self.wav = np.linspace(minwav, maxwav, num=num)
+        self.thru = np.ones(num)*val
+        self.minwav = minwav
+        self.maxwav = maxwav
+        self.val = val
+
+    @lazyproperty
+    def filt(self):
+        if self.interp_kind == 'no interp':
+            return np.vectorize(lambda x: (self.val if self.minwav < x and x < self.maxwav else 0), otypes=[np.float64])
+        else:
+            return super().filt
+
+
 
 class PSF(metaclass=ABCMeta):
     """
@@ -284,8 +326,13 @@ class PSF(metaclass=ABCMeta):
         raise NotImplementedError  # must be implemented in the psf child classes
 
     def _convolve_over(self, image):
-        self.size = image.shape
-        return astropy_convolve(image, self.kernel)
+        if len(image.shape) != 2 and len(image.shape) != 3: raise ValueError('Image must be either a 2d or 3d object.')
+        if self.size is None: 
+            self.size = image.shape[-2:]  # take the last 2 dimensions as the image shape to use 
+        kernel = self.kernel
+        if len(image.shape) == 3:
+            kernel = kernel.reshape([1, *kernel.shape])
+        return scipy_convolve(image, kernel, mode='same')
 
 
 class GaussianPSF(PSF):
