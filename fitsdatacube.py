@@ -8,14 +8,16 @@ Use the `load_dat_file` function to load a dat file into a Pandas DataFrame.
 
 See the accompanying Jupyter Notebook SKIRT-output-access.ipynb for example usages.
 
-REQUIRES: numpy, matplotlib, scipy, astropy, pandas
+REQUIRES: numpy, matplotlib, scipy, astropy, pandas (for load_dat_file only)
 
 Jaeden Bardati 2023
 """
 
+from os import path
+from abc import ABCMeta
+
 import numpy as np
 
-import matplotlib
 import matplotlib.pyplot as plt
 
 from scipy.interpolate import interp1d as scipy_interp1d
@@ -26,16 +28,12 @@ from astropy.io import fits as astropy_fits
 from astropy.utils.data import get_pkg_data_filename as astropy_get_pkg_data_filename
 from astropy.utils.decorators import lazyproperty
 
-import pandas as pd
-
-from abc import ABCMeta
-
 
 class FitsDatacube:
     """
         Class that wraps some useful methods for loading and accessing a fits image.
     """
-    DEFAULT_UNITS = ['Jy', 'micron']
+    DEFAULT_UNITS = ('Jy', 'micron')
     
     def _load(self, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _debug_log=False):
         # Loads a fits file at <filename>.
@@ -142,7 +140,8 @@ class FitsDatacube:
         return (np.mean(R1) + np.mean(R2))/2
     
     def convolve_PSF(self, psf, inplace=False):
-        if PSF not in type(psf).__mro__: raise Exception('The psf must be a child of the PSF class.')
+        if PSF not in type(psf).__mro__:
+            psf = CustomPSF(psf)
         copy = self if inplace else self.copy()
         copy._dc = psf._convolve_over(copy._dc)
         return copy
@@ -237,13 +236,14 @@ class Filter:
     """
     DEFAULT_DELIM = ' '
     DEFAULT_KIND = 'linear'
-    DEFAULT_UNITS = ['micron', '1']  # wav, thru
+    DEFAULT_UNITS = ('micron', '1')  # wav, thru
     
     def __init__(self, filename, delim=DEFAULT_DELIM, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, interp_kind=DEFAULT_KIND, _no_load=False):
         """
         Loads a filter file at <filename>.
         """
         self.filename = filename
+        self.name = path.splitext(path.basename(filename))[0] if filename is not None else None
         if not _no_load: 
             self.wav, self.thru = self._load(delim=delim)
         self.interp_kind = interp_kind
@@ -288,10 +288,11 @@ class Filter:
     
 
 class BinaryFilter(Filter):
-    DEFAULT_KIND = 'no interp'
+    DEFAULT_KIND = None
 
     def __init__(self, minwav, maxwav, val=1.0, num=100, interp_kind=DEFAULT_KIND):
         super().__init__(None, interp_kind=interp_kind, _no_load=True)
+        self.name = 'Binary Filter'
         self.wav = np.linspace(minwav, maxwav, num=num)
         self.thru = np.ones(num)*val
         self.minwav = minwav
@@ -300,7 +301,7 @@ class BinaryFilter(Filter):
 
     @lazyproperty
     def filt(self):
-        if self.interp_kind == 'no interp':
+        if self.interp_kind is None:
             return np.vectorize(lambda x: (self.val if self.minwav < x and x < self.maxwav else 0), otypes=[np.float64])
         else:
             return super().filt
@@ -357,11 +358,24 @@ class GaussianPSF(PSF):
         psf = np.exp(-(x*x + y*y)/(2.0*self.sigma**2))
         psf /= np.sum(psf)
         return psf
+    
+class CustomPSF(PSF):
+    """Custom class to incorporate a custom array psf."""
+    def __init__(self, kernel):
+        try:
+            size=kernel.shape
+            assert len(size) == 2 or len(size) == 3, 'The kernel must be a 2d or 3d array.'
+        except AttributeError:
+            raise TypeError('The kernel must have a shape attribute.')
+        self.kernel = kernel
+        super().__init__(size=size)
 
 
 def load_dat_file(filename):
     """Function that loads a .dat file in the format of SKIRT input/output."""
     # get header
+    import pandas as pd
+
     header = {}
     firstNonCommentRowIndex = None
     with open(filename) as file:
