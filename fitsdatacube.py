@@ -13,8 +13,9 @@ REQUIRES: numpy, matplotlib, scipy, astropy, pandas (for load_dat_file only)
 Jaeden Bardati 2023
 """
 
-from os import path
 from abc import ABCMeta
+from os import path
+import warnings
 
 import numpy as np
 
@@ -25,7 +26,6 @@ from scipy.signal import convolve as scipy_convolve
 
 from astropy import units as astropy_u
 from astropy.io import fits as astropy_fits
-from astropy.utils.data import get_pkg_data_filename as astropy_get_pkg_data_filename
 from astropy.utils.decorators import lazyproperty
 
 
@@ -35,26 +35,26 @@ class FitsDatacube:
     """
     DEFAULT_UNITS = ('Jy', 'micron')
     
-    def _load(self, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _debug_log=False):
+    def _load(self, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS):
         # Loads a fits file at <filename>.
-        _dc_obj = astropy_get_pkg_data_filename(self.filename)
+        with astropy_fits.open(self.filename) as _hdu_list:
+            assert len(_hdu_list) == 2, 'Unrecognized fits datacube format. The <FitsDatacube> requires two HDUs: the first must be a PrimaryHDU containing the datacube and the second must be a TableHDU containing the wavelengths.'
+            self._dc = np.array(_hdu_list[0].data, dtype=float)
+            self.wav = np.array(_hdu_list[1].data, dtype=float)
         
-        if _debug_log: 
-            print(astropy_fits.info(_dc_obj))
-        
-        self._dc = np.array(astropy_fits.getdata(_dc_obj, ext=0), dtype=float)
-        self.wav = np.array(astropy_fits.getdata(_dc_obj, ext=1), dtype=float)
-        
+        assert len(self._dc.shape) == 3 and len(self.wav.shape) == 1, 'Unrecognized fits datacube format. The first HDU must be the datacube and the second TableHDU must be the wavelengths.'
         self.shape = self._dc.shape
         self._nwav = self._dc.shape[0]
         self._npix = self._dc.shape[1:]
-        assert self._nwav == len(self.wav)
+        assert self._nwav == len(self.wav), 'Unrecognized fits datacube format. The wavelengths must correspond to the zeroth axis of the datacube.'
+        if self._npix[0] != self._npix[1]: 
+            warnings.warn('Non-square datacube. You may encounter some unexpected issues.')
         
         self.units = iunits
         if iunits != ounits: 
             self.convert_units(ounits)
     
-    def __init__(self, filename=None, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _debug_log=False, _no_load=False):
+    def __init__(self, filename=None, iunits=DEFAULT_UNITS, ounits=DEFAULT_UNITS, _no_load=False):
         """
         Loads a fits file at <filename>.
         <iunits> indicate the input units (fits file) and <ounits> indicate the output units (FitsDatacube instance)
@@ -62,7 +62,7 @@ class FitsDatacube:
         """
         if not _no_load:
             self.filename = filename
-            self._load(iunits=iunits, ounits=ounits, _debug_log=_debug_log)
+            self._load(iunits=iunits, ounits=ounits)
         else:
             self.filename = None
             self._dc = None
