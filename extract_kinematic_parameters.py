@@ -4,7 +4,7 @@ Run this file to interface with my ppxf hdf5 file output.
 
 This code packages a few python modules to work. Namely, it uses:
  - statmorph: pip install (Rodriguez-Gomez et al., 2019)
- - Nevin's radon transform code: included in this repo
+ - Nevin's radon transform code (slightly altered): included in this repo
      - radon_python_mod.py from https://github.com/beckynevin/Kinematics_SUNRISE (Nevin et al., 2019, based on Stark et al. 2018)
      - compare_centers function from https://github.com/beckynevin/Kinematics_SUNRISE/blob/master/Kinematic_Hexagons_Display.ipynb
  - Kinemetry: https://www.aip.de/en/members/davor-krajnovic/kinemetry/ (Krajnovic et al., 2006)
