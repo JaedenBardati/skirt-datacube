@@ -394,6 +394,7 @@ def run_ppxf_individual(root_file, hf_file, nphotons, psf=None, filters=None, si
                 hf.create_dataset(str(image_name), data=image.data)
                 hf.create_dataset(str(image_name) + ' error', data=image_err.data)
         hf.create_dataset('extent', data=extent)
+        hf.create_dataset('nphotons', data=[nphotons])
 
     if log: log_timing()
     return
@@ -403,11 +404,12 @@ def run_ppxf_individual(root_file, hf_file, nphotons, psf=None, filters=None, si
 
 if __name__ == "__main__":
     from filearguments import get_filearguments  # custom filearguments file (https://gist.github.com/JaedenBardati/81c4543b84a49584ea09bf529fbdf29c)
-    res = get_filearguments(i=str, o=str, require_options=True, option_prefix='-')  # arguments: (input, output) 
-    root_files, hf_files = res['-i'], res['-o']
+    res = get_filearguments(i=str, o=str, n=float, require_options=True, option_prefix='-')  # arguments: (input, output) 
+    root_files, hf_files, nphotons = res['-i'], res['-o'], res['-n']   # if no -n tag, use instead: nphotons = 5e9
+    print(len(root_files), root_files)
+    print(len(hf_files), hf_files)
     assert len(root_files) == len(hf_files)
     
-    nphotons = 5e9
     psf = GaussianPSF(fwhm=1)
     filters = [
         Filter('/home/jbardati/projects/def-jruan/jbardati/Romulus25/SKIRT/filters/uband.filter', ounits=('micron', '1')), 
@@ -415,7 +417,13 @@ if __name__ == "__main__":
         Filter('/home/jbardati/projects/def-jruan/jbardati/Romulus25/SKIRT/filters/rband.filter', ounits=('micron', '1'))
     ]
  
+    num_errors = 0
     for root_file, hf_file in zip(root_files, hf_files):
-        run_ppxf_individual(root_file, hf_file, nphotons, psf=psf, filters=filters, sim_ext='total', parallel=False, progress_bar=False, log=True, plot=False)
+        try:
+            run_ppxf_individual(root_file, hf_file, nphotons, psf=psf, filters=filters, sim_ext='total', parallel=False, progress_bar=False, log=True, plot=False)
+        except Exception as e:
+            print('Error for ', root_file, hf_file, ": ", e)
+            num_errors += 1
         print()
     print('All done!')
+    print('No errors!' if num_errors == 0 else 'Errored on %d/%d runs.' % (num_errors, len(hf_files)))
