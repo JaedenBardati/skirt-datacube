@@ -113,6 +113,9 @@ class FitsDatacube:
     __and__       = lambda self, y: self.copy(_dc_operation=lambda x: np.logical_and(x, y._dc) if type(y) is FitsDatacube else x.__and__(y))  
     __or__        = lambda self, y: self.copy(_dc_operation=lambda x: np.logical_or(x, y._dc) if type(y) is FitsDatacube else x.__or__(y))
     __invert__    = lambda self: self.copy(_dc_operation=lambda x: x.__invert__())
+
+    log10 = lambda self, *args, **kwargs: self.copy(_dc_operation=lambda x: np.log10(x, *args, **kwargs))
+    log = lambda self, *args, **kwargs: self.copy(_dc_operation=lambda x: np.log(x, *args, **kwargs))
     
     def sum(self): return np.sum(self._dc)
     def max(self): return np.max(self._dc)
