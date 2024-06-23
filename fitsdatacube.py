@@ -195,11 +195,11 @@ class FitsDatacube:
         return (fig, ax)
     
     @staticmethod
-    def _plot_image(image, cmap='gray', logscale=False, vmin=None, vmax=None, ret_im=False, **kwargs):
+    def _plot_image(image, cmap='gray', logscale=False, vmin=None, vmax=None, ret_im=False, extent=None, **kwargs):
         fig, ax = FitsDatacube._general_plot(**kwargs)
         if logscale:
             image = np.log10(image.copy())
-        im = ax.imshow(image, origin='lower', vmin=vmin, vmax=vmax, cmap=cmap)
+        im = ax.imshow(image, origin='lower', vmin=vmin, vmax=vmax, cmap=cmap, extent=extent)
         return (fig, ax) if not ret_im else (fig, ax, im)
     
     @staticmethod
