@@ -374,7 +374,7 @@ class CustomPSF(PSF):
         super().__init__(size=size)
 
 
-def load_dat_file(filename):
+def load_dat_file(filename, chunksize=None):
     """Function that loads a .dat file in the format of SKIRT input/output."""
     # get header
     import pandas as pd
@@ -397,17 +397,16 @@ def load_dat_file(filename):
                 firstNonCommentRowIndex = i
                 break
     assert firstNonCommentRowIndex is not None # otherwise the entire file is just comments
-    
-    # get data
-    df = pd.read_csv(filename, delim_whitespace=True, skiprows=firstNonCommentRowIndex, header=None)
-    
-    # adjust column names
+
+    # set up column names
     if firstNonCommentRowIndex == 0:
         columns = None
     else:
         columns = [None for i in range(max(header.keys()))]
         for k, v in header.items(): columns[k-1] = v
         assert None not in columns # otherwise, missing column 
-        df.columns = columns
+    
+    # get data
+    df = pd.read_csv(filename, delim_whitespace=True, skiprows=firstNonCommentRowIndex, header=None, names=columns, chunksize=chunksize)
     
     return df
