@@ -26,6 +26,13 @@ import scipy
 import scipy.stats
 import h5py
 
+try:
+    from my_timing import log_timing # custom timing file: see https://gist.github.com/JaedenBardati/e953033508000f637a4121982429a56e
+except ImportError:
+    # hack something together to replace it
+    import datetime
+    log_timing = lambda x: print(datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')+':', x)
+
 
 def extract_LOSVD_data(filename):
     """Extracts the LOSVD data from the given hdf5 file. Change this function if you store the data in another form."""
@@ -356,8 +363,145 @@ def get_morph(image, image_err, psf_kernel=None, npixels=5, sigma_thres=3, reg_s
     return morph
 
 
-## full extraction
+def get_radon_params(vel_masked, image_center, r_e, n_p=30, n_theta=30, plot=False, log=False):
+    """Returns radon profile kinematic parameters, including the kinematic center."""
+    from nevin_radon_python_mod import radon  # Nevin's code (slightly adapted to work for more general images)
 
+    extra_shape = (2*(image_center[0] - vel_masked.shape[0]//2), 2*(image_center[1] - vel_masked.shape[1]//2))
+    true_extra_size = max(abs(extra_shape[0]), abs(extra_shape[1]))  # to enforce a square box output
+    new_shape = (vel_masked.shape[0] + true_extra_size, vel_masked.shape[1] + true_extra_size)
+    extra2_shape = (true_extra_size - abs(extra_shape[0]), true_extra_size - abs(extra_shape[1]))  # extra shape on extra shape to make it the true extra shape; to make it square
+    assert extra2_shape[0] == 0 or extra2_shape[1] == 0, "At least one of the extra2_shape should always be 0"
+    assert extra2_shape[0]/2 == extra2_shape[0]//2 and extra2_shape[1]/2 == extra2_shape[1]//2, "The extra2_shape values should always be even"
+    extra_slice = (slice(max(0, -extra_shape[0])+extra2_shape[0]//2, min(new_shape[0]-extra_shape[0], new_shape[0])-extra2_shape[0]//2), 
+                   slice(max(0, -extra_shape[1])+extra2_shape[1]//2, min(new_shape[1]-extra_shape[1], new_shape[1])-extra2_shape[1]//2))  # for positioning the velocities into the new array shape
+
+    vel_shape_changed = np.ones(new_shape)*np.nan
+    vel_shape_changed[extra_slice[0], extra_slice[1]] = vel_masked.copy().data
+    changed_mask = np.ones(new_shape).astype(bool)
+    changed_mask[extra_slice[0], extra_slice[1]] = vel_masked.copy().mask
+    vel_shape_changed = np.ma.masked_array(vel_shape_changed, mask=changed_mask)
+    
+    if plot:
+        fig = plt.figure(figsize=(12, 5))
+
+        ax1 = fig.add_subplot(1, 2, 1)
+        ax1.title.set_text('Original velmap')
+        plt.imshow(vel_masked, origin='lower', cmap='RdBu_r')
+        plt.plot([image_center[1], image_center[1]], [0, vel_masked.shape[0]], color='red') #vertical line
+        plt.plot([0, vel_masked.shape[1]], [image_center[0], image_center[0]], color='red') #horizontal line
+        ax1.set_ylim((0, vel_masked.shape[0]))
+        ax1.set_xlim((0, vel_masked.shape[1]))
+
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax2.title.set_text('Shape-changed velmap')
+        plt.imshow(vel_shape_changed, origin='lower', cmap='RdBu_r')
+        plt.plot([vel_shape_changed.shape[1]//2, vel_shape_changed.shape[1]//2], [0, vel_shape_changed.shape[0]], color='red') #vertical line
+        plt.plot([0, vel_shape_changed.shape[1]], [vel_shape_changed.shape[0]//2, vel_shape_changed.shape[0]//2], color='red') #horizontal line
+        ax2.set_ylim((0, vel_shape_changed.shape[0]))
+        ax2.set_xlim((0, vel_shape_changed.shape[1]))
+
+    assert vel_masked[image_center[0], image_center[1]].data == vel_shape_changed[vel_shape_changed.shape[0]//2, vel_shape_changed.shape[1]//2].data, 'Something is wrong with the extra shape algorithm and the center of the velocity map is not the image center.'
+       
+    # run Nevin's code
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore") # ignore some warnings that are annoying
+        
+        radon_vel = vel_shape_changed.copy()  # to .data or not .data
+        
+        rad = radon(radon_vel, n_p, n_theta, r_e, 1, 'yes' if plot else 'no')
+        if rad[8] == 1:
+            expanded = 1
+            if log: print('Expanding grid and trying again..')
+            rad = radon(radon_vel, n_p, n_theta, r_e, 2, 'yes' if plot else 'no')
+            assert rad[8] != 1, 'Must expand grid of centers again. This will increase the uncertainty on the kinematic center, unless a more sofisticated algorithm is made.'
+        else:
+            expanded = 0
+        box_list_min_index, R_AB_list_min_index, radon_A, radon_A2, p_list, theta_list, theta_hat_list_min_index, theta_hat_e_list_min_index, expand = rad
+    
+    # get relevant parameters
+    cx_kin, cy_kin = image_center[1]-box_list_min_index[1], image_center[0]-box_list_min_index[0] # convert back to regular coords
+    assert 0 <= cx_kin <= vel_masked.shape[1] and 0 <= cy_kin <= vel_masked.shape[0], 'Something with the shape-change coordinate transformation went terribly wrong.' 
+    
+    return cx_kin, cy_kin, radon_A, radon_A2, expanded
+
+
+def get_pafit_params(vel_masked, vel_err_masked, kinematic_center, morphPA, plot=False):
+    """Returns pafit kinematic parameters, including delta PA, using morphPA."""
+    from pafit import fit_kinematic_pa as paf  # pip install package
+    
+    # prepare data
+    vel = vel_masked.data[~vel_masked.mask].ravel().copy()
+    vel_err = vel_err_masked[~vel_masked.mask].ravel().copy()
+
+    vel -= np.median(vel)  # subtract an initial estimate of the systematic velocity
+
+    xbin = ((np.tile(np.arange(0, vel_masked.shape[0]),(vel_masked.shape[1],1)).ravel() - kinematic_center[0]))[~vel_masked.ravel().mask]
+    ybin = ((np.tile(np.arange(0, vel_masked.shape[1]).reshape((vel_masked.shape[1], 1)), vel_masked.shape[0]).ravel()-kinematic_center[1]))[~vel_masked.ravel().mask]
+    
+    if plot:
+        matplotlib.pyplot.rcdefaults()
+
+    # fit the vel model
+    angBest, angErr, vSyst = paf.fit_kinematic_pa(xbin, ybin, vel, debug=False, nsteps=361, quiet=True, plot=plot, dvel=vel_err)
+    vSyst += np.median(vel)   # add back the initial estimate
+
+    # get the vel model
+    vel_model = paf.symmetrize_velfield(xbin, ybin, vel, sym=1, pa=angBest)
+    assert vel_model.size == vel.size
+
+    if plot:
+        plt.show()
+        matplotlib.rcParams.update(MY_PLT_PARAMS)
+    
+    # find parameters
+    resid = np.abs(vel - vel_model).sum()/vel.size
+    delta_PA = abs(angBest - morphPA)  # in deg
+
+    return angBest, angErr, vSyst, resid, delta_PA
+
+
+def get_kinemetry_params(sigma_masked, sigma_err_masked, kinematic_center, plot=False):
+    """Returns kinemetry kinematic parameters, namely sigma_asym and vel_asym."""
+    import kinemetry as kin   # python file (see above on where to get)
+    from kinemetry import kinemetry 
+    
+    if plot:
+        matplotlib.pyplot.rcdefaults()
+    
+    try:
+        xbin = ((np.tile(np.arange(0, sigma_masked.shape[0]),(sigma_masked.shape[1],1)).ravel() - kinematic_center[0]))[~sigma_masked.ravel().mask]
+        ybin = ((np.tile(np.arange(0, sigma_masked.shape[1]).reshape((sigma_masked.shape[1], 1)), sigma_masked.shape[0]).ravel()-kinematic_center[1]))[~sigma_masked.ravel().mask]
+        
+        # run kinemetry
+        sig = sigma_masked.data[~sigma_masked.mask].ravel().copy()  # this assumes the same mask between sigma and vel
+        sig_err = sigma_err_masked[~sigma_err_masked.mask].ravel().copy()
+        k = kinemetry(xbin, ybin, sig, error=sig_err, fixcen=False, scale=0.1, nrad=300, plot=plot, verbose=False)
+        
+        if plot:
+            matplotlib.rcParams.update(MY_PLT_PARAMS)
+        
+        # find parameters
+        sigma_asym = np.mean((k.cf[:, 1:-1]/5).sum(axis=1)/k.cf[:, 0])
+        vel_asym = np.mean((k.cf[:, 2:-1]/4).sum(axis=1)/k.cf[:, 1])
+    except:
+        sigma_asym = np.nan
+        vel_asym = np.nan
+        warnings.warn('Long kinemetry run errored, filling sigma_asym and vel_asym with NaNs.')
+
+
+def get_spin_param(flux_masked, vel_masked, sigma_masked, kinematic_center):
+        """Calculates the spin parameter."""
+        cx_kin, cy_kin = kinematic_center
+        _xs = np.tile((np.arange(0, vel_masked.shape[0]) - cx_kin),(vel_masked.shape[1],1))
+        _ys = np.tile((np.arange(0, vel_masked.shape[1]) - cy_kin).reshape((vel_masked.shape[1], 1)), vel_masked.shape[0])
+        dmap_kin = np.sqrt(_xs**2 + _ys**2)
+
+        spin_param = (flux_masked*dmap_kin*np.abs(vel_masked)).sum()/(flux_masked*dmap_kin*(vel_masked**2+sigma_masked**2)**0.5).sum()
+        return spin_param
+
+
+## full extraction
 def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None, subvel='mean', 
                               psf=None, n_p=30, n_theta=30, skiplongkin=False, log=False, plot=False):
     """
@@ -385,9 +529,6 @@ def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None,
     assert filename is not None or data is not None, 'Must enter "filename" to extract data from a file, or the "data" itself.'
     assert filename is None or data is None, 'Can only enter one of either "filename" or "data".'
     assert subvel in ['mean', 'median', 'None', None], 'The "subvel" parameter must be either None, mean or median.'
-    
-    if log: 
-        from my_timing import log_timing
         
     if plot:
         MY_PLT_PARAMS = {'font.size': 24, 'axes.linewidth': 2.0}
@@ -708,68 +849,10 @@ def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None,
     ## Radon profile (using Becky Nevin's code)
     if log: 
         log_timing('Computing the radon profile and kinematic center...')
-        
-    from nevin_radon_python_mod import radon  # Nevin's code (slightly adapted to work for more general images)
-    
-    # need to center the velocity at the r-band center
+
     image_center = (int(rband_morph.yc_asymmetry), int(rband_morph.xc_asymmetry))  # CY, CX in original coords
-
-    extra_shape = (2*(image_center[0] - final_vel_masked.shape[0]//2), 2*(image_center[1] - final_vel_masked.shape[1]//2))
-    true_extra_size = max(abs(extra_shape[0]), abs(extra_shape[1]))  # to enforce a square box output
-    new_shape = (final_vel_masked.shape[0] + true_extra_size, final_vel_masked.shape[1] + true_extra_size)
-    extra2_shape = (true_extra_size - abs(extra_shape[0]), true_extra_size - abs(extra_shape[1]))  # extra shape on extra shape to make it the true extra shape; to make it square
-    assert extra2_shape[0] == 0 or extra2_shape[1] == 0, "At least one of the extra2_shape should always be 0"
-    assert extra2_shape[0]/2 == extra2_shape[0]//2 and extra2_shape[1]/2 == extra2_shape[1]//2, "The extra2_shape values should always be even"
-    extra_slice = (slice(max(0, -extra_shape[0])+extra2_shape[0]//2, min(new_shape[0]-extra_shape[0], new_shape[0])-extra2_shape[0]//2), 
-                   slice(max(0, -extra_shape[1])+extra2_shape[1]//2, min(new_shape[1]-extra_shape[1], new_shape[1])-extra2_shape[1]//2))  # for positioning the velocities into the new array shape
-
-    vel_shape_changed = np.ones(new_shape)*np.nan
-    vel_shape_changed[extra_slice[0], extra_slice[1]] = final_vel_masked.copy().data
-    changed_mask = np.ones(new_shape).astype(bool)
-    changed_mask[extra_slice[0], extra_slice[1]] = final_vel_masked.copy().mask
-    vel_shape_changed = np.ma.masked_array(vel_shape_changed, mask=changed_mask)
-    
-    if plot:
-        fig = plt.figure(figsize=(12, 5))
-
-        ax1 = fig.add_subplot(1, 2, 1)
-        ax1.title.set_text('Original velmap')
-        plt.imshow(final_vel_masked, origin='lower', cmap='RdBu_r')
-        plt.plot([image_center[1], image_center[1]], [0, final_vel_masked.shape[0]], color='red') #vertical line
-        plt.plot([0, final_vel_masked.shape[1]], [image_center[0], image_center[0]], color='red') #horizontal line
-        ax1.set_ylim((0, final_vel_masked.shape[0]))
-        ax1.set_xlim((0, final_vel_masked.shape[1]))
-
-        ax2 = fig.add_subplot(1, 2, 2)
-        ax2.title.set_text('Shape-changed velmap')
-        plt.imshow(vel_shape_changed, origin='lower', cmap='RdBu_r')
-        plt.plot([vel_shape_changed.shape[1]//2, vel_shape_changed.shape[1]//2], [0, vel_shape_changed.shape[0]], color='red') #vertical line
-        plt.plot([0, vel_shape_changed.shape[1]], [vel_shape_changed.shape[0]//2, vel_shape_changed.shape[0]//2], color='red') #horizontal line
-        ax2.set_ylim((0, vel_shape_changed.shape[0]))
-        ax2.set_xlim((0, vel_shape_changed.shape[1]))
-
-    assert final_vel_masked[image_center[0], image_center[1]].data == vel_shape_changed[vel_shape_changed.shape[0]//2, vel_shape_changed.shape[1]//2].data, 'Something is wrong with the extra shape algorithm and the center of the velocity map is not the image center.'
-       
-    # run Nevin's code
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore") # ignore some warnings that are annoying
-        
-        radon_vel = vel_shape_changed.copy()  # to .data or not .data
-        
-        r_e = rband_morph.rhalf_circ  # use the r-band effective radius
-        rad = radon(radon_vel, n_p, n_theta, r_e, 1, 'yes' if plot else 'no')
-        if rad[8] == 1:
-            expanded = 1
-            if log: print('Expanding grid and trying again..')
-            rad = radon(radon_vel, n_p, n_theta, r_e, 2, 'yes' if plot else 'no')
-            assert rad[8] != 1, 'Must expand grid of centers again. This will increase the uncertainty on the kinematic center, unless a more sofisticated algorithm is made.'
-        else:
-            expanded = 0
-        box_list_min_index, R_AB_list_min_index, radon_A, radon_A2, p_list, theta_list, theta_hat_list_min_index, theta_hat_e_list_min_index, expand = rad
-    
-    # get relevant parameters
-    cx_kin, cy_kin = image_center[1]-box_list_min_index[1], image_center[0]-box_list_min_index[0] # convert back to regular coords
-    assert 0 <= cx_kin <= final_vel_masked.shape[1] and 0 <= cy_kin <= final_vel_masked.shape[0], 'Something with the shape-change coordinate transformation went terribly wrong.' 
+    r_e = rband_morph.rhalf_circ  # use the r-band effective radius
+    cx_kin, cy_kin, radon_A, radon_A2, expanded = get_radon_params(final_vel_masked, image_center, r_e, n_p=n_p, n_theta=n_theta, plot=plot, log=log)
     
     DATA['radon cx'] = cx_kin
     DATA['radon cy'] = cy_kin
@@ -782,38 +865,10 @@ def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None,
     ## Kinemetry 1 (pafit)
     if log: 
         log_timing('Computing the delta PA and residual velocity map...')
-    
-    from pafit import fit_kinematic_pa as paf  # pip install package
 
-    # prepare data
-    kinemetry_center = (final_vel_masked.shape[0]/2, final_vel_masked.shape[1]/2)  # in pixels; should ideally be (cx_kin, cy_kin)
-
-    vel = final_vel_masked.data[~final_vel_masked.mask].ravel().copy()
-    vel_err = final_vel_err[~final_vel_masked.mask].ravel().copy()
-
-    vel -= np.median(vel)  # subtract an initial estimate of the systematic velocity
-
-    xbin = ((np.tile(np.arange(0, final_vel_masked.shape[0]),(final_vel_masked.shape[1],1)).ravel() - kinemetry_center[0]))[~final_vel_masked.ravel().mask]
-    ybin = ((np.tile(np.arange(0, final_vel_masked.shape[1]).reshape((final_vel_masked.shape[1], 1)), final_vel_masked.shape[0]).ravel()-kinemetry_center[1]))[~final_vel_masked.ravel().mask]
-    
-    if plot:
-        matplotlib.pyplot.rcdefaults()
-
-    # fit the vel model
-    angBest, angErr, vSyst = paf.fit_kinematic_pa(xbin, ybin, vel, debug=False, nsteps=361, quiet=True, plot=plot, dvel=vel_err)
-    vSyst += np.median(vel)   # add back the initial estimate
-
-    # get the vel model
-    vel_model = paf.symmetrize_velfield(xbin, ybin, vel, sym=1, pa=angBest)
-    assert vel_model.size == vel.size
-
-    if plot:
-        plt.show()
-        matplotlib.rcParams.update(MY_PLT_PARAMS)
-    
-    # find parameters
-    resid = np.abs(vel - vel_model).sum()/vel.size
-    delta_PA = abs(angBest - (gband_morph.orientation_asymmetry*180/np.pi + 90))  # in deg
+    kinematic_center = (cx_kin, cy_kin)  # in pixels; originally was (final_vel_masked.shape[0]/2, final_vel_masked.shape[1]/2)
+    morphPA = (gband_morph.orientation_asymmetry*180./np.pi + 90.)
+    angBest, angErr, vSyst, resid, delta_PA = get_pafit_params(final_vel_masked, final_vel_err, kinematic_center, morphPA, plot=plot)
     
     DATA['kin angBest'] = angBest
     DATA['kin angErr'] = angErr
@@ -827,44 +882,18 @@ def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None,
     if not skiplongkin:
         if log: 
             log_timing('Computing the velocity dispersion kinemetry parameters...')
-        
-        import kinemetry as kin   # python file (see above on where to get)
-        from kinemetry import kinemetry 
-        
-        if plot:
-            matplotlib.pyplot.rcdefaults()
-        
-        try:
-            # run kinemetry
-            sig = final_sigma_masked.data[~final_vel_masked.mask].ravel().copy()  # this assumes the same mask between sigma and vel
-            sig_err = final_sigma_masked[~final_vel_masked.mask].ravel().copy()
-            k = kinemetry(xbin, ybin, sig, error=sig_err, fixcen=False, scale=0.1, nrad=300, plot=plot, verbose=False)
             
-            if plot:
-                matplotlib.rcParams.update(MY_PLT_PARAMS)
-            
-            # find parameters
-            sigma_asym = np.mean((k.cf[:, 1:-1]/5).sum(axis=1)/k.cf[:, 0])
-            vel_asym = np.mean((k.cf[:, 2:-1]/4).sum(axis=1)/k.cf[:, 1])
+        sigma_asym, vel_asym = get_kinemetry_params(final_sigma_masked, final_sigma_err, kinematic_center, plot=plot)
 
-            DATA['kin sigma_asym'] = sigma_asym
-            DATA['kin vel_asym'] = vel_asym
-        except:
-            DATA['kin sigma_asym'] = np.nan
-            DATA['kin vel_asym'] = np.nan
-            warnings.warn('Long kinemetry run errored, filling sigma_asym and vel_asym with NaNs.')
-    
+        DATA['kin sigma_asym'] = sigma_asym
+        DATA['kin vel_asym'] = vel_asym
     
     #######################################################
-    ## Spin parameter
+    ## Spin parameter+
     if log: 
         log_timing('Computing the spin parameter...')
     
-    _xs = np.tile((np.arange(0, final_vel_masked.shape[0]) - cx_kin),(final_vel_masked.shape[1],1))
-    _ys = np.tile((np.arange(0, final_vel_masked.shape[1]) - cy_kin).reshape((final_vel_masked.shape[1], 1)), final_vel_masked.shape[0])
-    dmap_kin = np.sqrt(_xs**2 + _ys**2)
-
-    spin_param = (rband_image_masked*dmap_kin*np.abs(final_vel_masked)).sum()/(rband_image_masked*dmap_kin*(final_vel_masked**2+final_sigma_masked**2)**0.5).sum()
+    spin_param = get_spin_param(rband_image_masked, final_vel_masked, final_sigma_masked, kinematic_center)
     fast_rotator_stat = spin_param - 0.08 - rband_morph.ellipticity_asymmetry/4   # use rband ellipticity
 
     DATA['my spin_param'] = spin_param
@@ -937,85 +966,6 @@ def run_extraction_individual(filename=None, data=None, z=None, pixelscale=None,
 
     return DATA
 
-        
-## Defaults
-from fitsdatacube import GaussianPSF # custom package
-
-DEFAULT_PSF = GaussianPSF(fwhm=1) ## this is the same one that is entered into run_ppxf_individual in run_ppxf_on_skirt.py 
-DEFAULT_PIXELSCALE = 0.1
-DEFAULT_FILEEXT = '.h5'
-
-def DEFAULT_REDSHIFT_FUNCTION(filename):
-    """This must be customized. This specfic function is unique to romulus25 formatted in a way that I like."""
-    import os
-    just_filename = os.path.split(filename)[1]  # get just the filename from the path
-    step = int(just_filename[6:].split('_')[0]) # custom identifier form
-    step_redshift_dictionary = {
-        694: 4.977045553983204, 909: 3.9987908900057905, 1270: 2.999730532662382, 1945: 1.999866242206278, 
-        2048: 1.8960673164146993, 2159: 1.7932867461336923, 2281: 1.689754445252182, 2304: 1.6712331299362209, 
-        2411: 1.588839351771342, 2536: 1.4997393169017066, 2547: 1.492236174108259, 2560: 1.4834355967903856, 
-        2690: 1.3992051629582094, 2816: 1.3235575219650384, 2840: 1.309758252352847, 2998: 1.2233366039282516, 
-        3072: 1.1853049846852821, 3163: 1.140479124986304, 3328: 1.0641819980905391, 3336: 1.0606344086283346, 
-        3478: 0.9998100146757658, 3517: 0.9837816305553304, 3584: 0.9568846984293302, 3707: 0.9094935825547465, 
-        3840: 0.8609266989851763, 3905: 0.8381287532902209, 4096: 0.774398375005892, 4111: 0.769587321565466, 
-        4173: 0.7499841583835849, 4326: 0.7034631603233255, 4352: 0.6958070914669776, 4549: 0.6399790373658016, 
-        4608: 0.6239681449700463, 4781: 0.5787550553108292, 4864: 0.5579284854772784, 5022: 0.5197198785548629, 
-        5107: 0.4999001078658487, 5120: 0.4969122099805612, 5271: 0.4630143029385907, 5376: 0.44028086756423757, 
-        5529: 0.40830521105884254, 5632: 0.3875040573920594, 5795: 0.3557019492001796, 5888: 0.338137317038685, 
-        6069: 0.30508457947303547, 6144: 0.29180526368008475, 6350: 0.25650758630744686, 6390: 0.24984487724165594, 
-        6400: 0.24818857919248094, 6640: 0.20952035371375488, 6656: 0.20701384803795775, 6912: 0.1680455397893872, 
-        6937: 0.16435041362805203, 7168: 0.13107962307367194, 7212: 0.1249144540624576, 7241: 0.12088008658345895, 
-        7394: 0.09996738303039998, 7424: 0.09593843407808444, 7552: 0.07900276297443654, 7680: 0.06246651955101412, 
-        7779: 0.04994019580335607, 7869: 0.03874529195980081, 7936: 0.030527243817950023, 8192: -7.465139617579553e-12
-    } # unique to romulus25
-    redshift = step_redshift_dictionary[step]
-    return redshift
-
-
-## main 
-def main(input_folder, output_file, redshift_function=DEFAULT_REDSHIFT_FUNCTION, shuffle_folder=False,
-         ext=DEFAULT_FILEEXT, psf=DEFAULT_PSF, pixelscale=DEFAULT_PIXELSCALE, log=False, plot=False, raise_error=True):
-    """Runs parameter extraction on all files in a folder specified by the file arguments.
-    Redshift function takes a filename in the folder and determines the redshift from it."""
-    import glob, os
-    import pandas as pd
- 
-    if log: 
-        from my_timing import log_timing
-
-    # construct dataframe
-    data = []
-    glob_of_files = glob.glob(os.path.join(input_folder, '*' + ext))
-    if shuffle_folder:
-        import numpy as np
-        glob_of_files = sorted(glob_of_files, key=lambda k: np.random.rand())
-
-    if log:
-        print('There are {} files in the folder {} .\n'.format(len(glob_of_files), input_folder))
-    
-    for filename in glob_of_files:
-        if log: 
-            log_timing('Extracting parameters from {} ...'.format(filename))
-        try:
-            data.append(run_extraction_individual(filename=filename, z=redshift_function(filename), 
-                                                  pixelscale=pixelscale, psf=psf, log=False, plot=plot))
-        except Exception as e:
-            if raise_error:
-                raise e
-            else:
-                warnings.warn(str(e))
-    
-    if log: 
-        log_timing()
-
-    df = pd.DataFrame(data)
-    
-    # save df to csv
-    df.to_csv(output_file, index=False, header=True)
-    if log: 
-        print('All done!')
-
-
 
 if __name__ == "__main__":
     from filearguments import get_filearguments  # custom filearguments file (https://gist.github.com/JaedenBardati/81c4543b84a49584ea09bf529fbdf29c)
@@ -1023,6 +973,82 @@ if __name__ == "__main__":
     # get file arguments
     res = get_filearguments(str, str)  # arguments: (input folder, output csv file)
     input_folder, output_file = res
+
+    
+    # default configuration
+    from fitsdatacube import GaussianPSF # custom package
+    DEFAULT_PSF = GaussianPSF(fwhm=1)    # this is the same one that is entered into run_ppxf_individual in run_ppxf_on_skirt.py 
+    
+    DEFAULT_PIXELSCALE = 0.1
+    DEFAULT_FILEEXT = '.h5'
+    
+    def DEFAULT_REDSHIFT_FUNCTION(filename):
+        """This must be customized. This specfic function is unique to romulus25 formatted in a way that I like."""
+        import os
+        just_filename = os.path.split(filename)[1]  # get just the filename from the path
+        step = int(just_filename[6:].split('_')[0]) # custom identifier form
+        step_redshift_dictionary = {
+            694: 4.977045553983204, 909: 3.9987908900057905, 1270: 2.999730532662382, 1945: 1.999866242206278, 
+            2048: 1.8960673164146993, 2159: 1.7932867461336923, 2281: 1.689754445252182, 2304: 1.6712331299362209, 
+            2411: 1.588839351771342, 2536: 1.4997393169017066, 2547: 1.492236174108259, 2560: 1.4834355967903856, 
+            2690: 1.3992051629582094, 2816: 1.3235575219650384, 2840: 1.309758252352847, 2998: 1.2233366039282516, 
+            3072: 1.1853049846852821, 3163: 1.140479124986304, 3328: 1.0641819980905391, 3336: 1.0606344086283346, 
+            3478: 0.9998100146757658, 3517: 0.9837816305553304, 3584: 0.9568846984293302, 3707: 0.9094935825547465, 
+            3840: 0.8609266989851763, 3905: 0.8381287532902209, 4096: 0.774398375005892, 4111: 0.769587321565466, 
+            4173: 0.7499841583835849, 4326: 0.7034631603233255, 4352: 0.6958070914669776, 4549: 0.6399790373658016, 
+            4608: 0.6239681449700463, 4781: 0.5787550553108292, 4864: 0.5579284854772784, 5022: 0.5197198785548629, 
+            5107: 0.4999001078658487, 5120: 0.4969122099805612, 5271: 0.4630143029385907, 5376: 0.44028086756423757, 
+            5529: 0.40830521105884254, 5632: 0.3875040573920594, 5795: 0.3557019492001796, 5888: 0.338137317038685, 
+            6069: 0.30508457947303547, 6144: 0.29180526368008475, 6350: 0.25650758630744686, 6390: 0.24984487724165594, 
+            6400: 0.24818857919248094, 6640: 0.20952035371375488, 6656: 0.20701384803795775, 6912: 0.1680455397893872, 
+            6937: 0.16435041362805203, 7168: 0.13107962307367194, 7212: 0.1249144540624576, 7241: 0.12088008658345895, 
+            7394: 0.09996738303039998, 7424: 0.09593843407808444, 7552: 0.07900276297443654, 7680: 0.06246651955101412, 
+            7779: 0.04994019580335607, 7869: 0.03874529195980081, 7936: 0.030527243817950023, 8192: -7.465139617579553e-12
+        } # unique to romulus25
+        redshift = step_redshift_dictionary[step]
+        return redshift
+
+    
+    # main function
+    def main(input_folder, output_file, redshift_function=DEFAULT_REDSHIFT_FUNCTION, shuffle_folder=False,
+             ext=DEFAULT_FILEEXT, psf=DEFAULT_PSF, pixelscale=DEFAULT_PIXELSCALE, log=False, plot=False, raise_error=True):
+        """Runs parameter extraction on all files in a folder specified by the file arguments.
+        Redshift function takes a filename in the folder and determines the redshift from it."""
+        import glob, os
+        import pandas as pd
+    
+        # construct dataframe
+        data = []
+        glob_of_files = glob.glob(os.path.join(input_folder, '*' + ext))
+        if shuffle_folder:
+            import numpy as np
+            glob_of_files = sorted(glob_of_files, key=lambda k: np.random.rand())
+    
+        if log:
+            print('There are {} files in the folder {} .\n'.format(len(glob_of_files), input_folder))
+        
+        for filename in glob_of_files:
+            if log: 
+                log_timing('Extracting parameters from {} ...'.format(filename))
+            try:
+                data.append(run_extraction_individual(filename=filename, z=redshift_function(filename), 
+                                                      pixelscale=pixelscale, psf=psf, log=False, plot=plot))
+            except Exception as e:
+                if raise_error:
+                    raise e
+                else:
+                    warnings.warn(str(e))
+        
+        if log: 
+            log_timing()
+    
+        df = pd.DataFrame(data)
+        
+        # save df to csv
+        df.to_csv(output_file, index=False, header=True)
+        if log: 
+            print('All done!')
+
     
     # run the main program using defaults
     matplotlib.use('Agg')
